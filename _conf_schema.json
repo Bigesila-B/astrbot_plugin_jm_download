@@ -1,0 +1,27 @@
+{
+  "download_dir": {
+    "description": "漫画下载临时目录",
+    "type": "string",
+    "default": "data/jm_downloads",
+    "hint": "下载漫画的临时存储目录，默认在 AstrBot data 目录下"
+  },
+  "keep_files": {
+    "description": "是否保留下载的文件",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会保留下载的PDF文件在 download_dir 目录中，否则发送后自动删除"
+  },
+  "timeout": {
+    "description": "下载超时时间(秒)",
+    "type": "int",
+    "default": 300,
+    "hint": "下载漫画的超时时间，网络较慢时建议调大到 600 秒以上"
+  },
+  "domain": {
+    "description": "禁漫域名",
+    "type": "string",
+    "default": "",
+    "hint": "可选。自定义禁漫域名，如 18comic.vip。留空则 jmcomic 自动选择可用域名",
+    "options": ["", "18comic.vip", "18comic.org", "jmcomic1.me"]
+  }
+}
