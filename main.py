@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -9,7 +11,7 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.api import message_components as Comp
 
 
-@register("astrbot_plugin_jm_download", "Bigesila-B", "JM漫画下载插件 - 支持下载禁漫天堂漫画为PDF并发送到QQ", "1.0.0")
+@register("astrbot_plugin_jm_download", "Bigesila-B", "JM漫画下载插件 - 支持下载禁漫天堂漫画为PDF并发送到QQ", "1.0.1")
 class JMDownloadPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -33,23 +35,30 @@ class JMDownloadPlugin(Star):
 
         try:
             timeout = self.config.get("timeout", 300)
-            pdf_path, title = await asyncio.wait_for(
-                asyncio.to_thread(self._download_comic, comic_id),
-                timeout=timeout,
+            download_task = asyncio.create_task(
+                asyncio.to_thread(self._download_comic, comic_id)
             )
+            try:
+                pdf_path, title, task_dir = await asyncio.wait_for(
+                    asyncio.shield(download_task), timeout=timeout,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                # to_thread 超时后不会停止线程；完成后仅回收该任务的产物。
+                download_task.add_done_callback(self._discard_download)
+                raise
 
-            file_name = os.path.basename(pdf_path)
+            try:
+                file_name = os.path.basename(pdf_path)
+                yield event.plain_result(f"下载完成: {title}\n正在发送PDF文件...")
 
-            yield event.plain_result(f"下载完成: {title}\n正在发送PDF文件...")
-
-            chain = [
-                Comp.Plain(f"{title}"),
-                Comp.File(file=pdf_path, name=file_name),
-            ]
-            yield event.chain_result(chain)
-
-            if not self.config.get("keep_files", False):
-                self._cleanup(pdf_path)
+                chain = [
+                    Comp.Plain(f"{title}"),
+                    Comp.File(file=pdf_path, name=file_name),
+                ]
+                yield event.chain_result(chain)
+            finally:
+                if not self.config.get("keep_files", False):
+                    self._cleanup(task_dir)
 
         except asyncio.TimeoutError:
             yield event.plain_result(
@@ -60,18 +69,22 @@ class JMDownloadPlugin(Star):
             yield event.plain_result(f"下载出错: {str(e)}")
 
     def _download_comic(self, comic_id: str):
-        """在同步线程中下载漫画并导出为 PDF，返回 (pdf_path, title) 或 raises Exception"""
+        """在独立任务目录下载，返回 (pdf_path, title, task_dir)。"""
         import jmcomic
 
-        download_dir = self.config.get("download_dir", "data/jm_downloads")
-        os.makedirs(download_dir, exist_ok=True)
-
-        domain = self.config.get("domain", "")
-        domain_line = f"\n  domain: {domain}" if domain else ""
-
-        option_yml = f"""dir_rule:
+        download_root = Path(self.config.get("download_dir", "data/jm_downloads")).expanduser().resolve()
+        download_root.mkdir(parents=True, exist_ok=True)
+        task_dir = Path(tempfile.mkdtemp(prefix=f"jm_{comic_id}_", dir=download_root))
+        option_path = None
+        try:
+            pdf_dir = task_dir / "pdf"
+            pdf_dir.mkdir()
+            domain = self.config.get("domain", "")
+            domain_line = f"\n  domain: {json.dumps(domain, ensure_ascii=False)}" if domain else ""
+            # JSON 字符串也是合法 YAML 字符串，避免 Windows 路径/特殊字符被误解析。
+            option_yml = f"""dir_rule:
   rule: Bd_Aid
-  base_dir: {download_dir}
+  base_dir: {json.dumps(str(task_dir), ensure_ascii=False)}
 client:
   impl: api{domain_line}
 download:
@@ -79,10 +92,8 @@ download:
     suffix: .jpg
 """
 
-        option_path = None
-        try:
             with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".yml", delete=False, encoding="utf-8"
+                mode="w", suffix=".yml", delete=False, encoding="utf-8", dir=task_dir
             ) as f:
                 f.write(option_yml)
                 option_path = f.name
@@ -91,49 +102,48 @@ download:
             jmcomic.download_album(
                 comic_id,
                 option,
-                extra=jmcomic.Feature.export_pdf(delete_original_file=True),
+                extra=jmcomic.Feature.export_pdf(
+                    pdf_dir=str(pdf_dir), delete_original_file=True,
+                ),
             )
 
-            # 查找生成的 PDF 文件（递归搜索子目录）
-            pdf_files = sorted(
-                Path(download_dir).rglob(f"*{comic_id}*.pdf"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
+            # 只接受本次导出目录中唯一的 PDF，绝不扫描共享目录或历史任务。
+            pdf_files = [path for path in pdf_dir.rglob("*.pdf") if path.is_file()]
             if not pdf_files:
-                pdf_files = sorted(
-                    Path(download_dir).rglob("*.pdf"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-
-            if pdf_files:
-                pdf_path = str(pdf_files[0])
-                title = pdf_files[0].stem
-                return (pdf_path, title)
-
-            # 下载完成但没找到 PDF，列出目录内容帮助排查
-            all_files = list(Path(download_dir).rglob("*"))
-            file_list = "\n".join(f"  {f}" for f in all_files[:20])
-            logger.error(
-                f"JM{comic_id} 下载后未找到 PDF 文件。"
-                f"目录 {download_dir} 内容:\n{file_list or '  (空)'}"
-            )
-            raise FileNotFoundError(f"JM{comic_id} PDF 导出失败")
+                raise FileNotFoundError(f"JM{comic_id} PDF 导出失败：本次任务未生成 PDF")
+            if len(pdf_files) != 1:
+                raise RuntimeError(f"JM{comic_id} 导出了多个 PDF，无法确定要发送的文件")
+            pdf_path = pdf_files[0].resolve()
+            if not pdf_path.is_relative_to(pdf_dir.resolve()):
+                raise RuntimeError("PDF 路径不在本次任务的导出目录中")
+            return str(pdf_path), pdf_path.stem, str(task_dir)
         except Exception:
+            self._cleanup(task_dir)
             raise
         finally:
             if option_path and os.path.exists(option_path):
                 os.unlink(option_path)
 
-    def _cleanup(self, pdf_path: str):
-        """清理下载的 PDF 文件及其空目录"""
+    def _discard_download(self, task):
+        """回收已超时或已取消请求在后台完成的下载。"""
+        if task.cancelled():
+            return
         try:
-            if os.path.isfile(pdf_path):
-                os.remove(pdf_path)
-            parent = os.path.dirname(pdf_path)
-            if os.path.isdir(parent) and not os.listdir(parent):
-                os.rmdir(parent)
+            _, _, task_dir = task.result()
+        except Exception:
+            # 下载失败时 _download_comic 已回收目录，并在此取走任务异常。
+            return
+        self._cleanup(task_dir)
+
+    def _cleanup(self, task_dir):
+        """仅删除下载根目录内由本插件创建的单个任务目录。"""
+        try:
+            root = Path(self.config.get("download_dir", "data/jm_downloads")).expanduser().resolve()
+            task_dir = Path(task_dir).resolve()
+            if task_dir.parent != root or not task_dir.name.startswith("jm_"):
+                raise ValueError("拒绝清理下载根目录或任务目录以外的路径")
+            if task_dir.exists():
+                shutil.rmtree(task_dir)
         except Exception as e:
             logger.warning(f"清理文件失败: {e}")
 

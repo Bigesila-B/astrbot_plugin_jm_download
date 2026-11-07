@@ -1,7 +1,7 @@
 name: astrbot_plugin_jm_download
 display_name: JM漫画下载
 desc: 支持通过QQ命令下载禁漫天堂(18comic)漫画为PDF并发送给用户
-version: v1.0.0
+version: v1.0.1
 author: Bigesila-B
 repo: https://github.com/Bigesila-B/astrbot_plugin_jm_download
 support_platforms:
